@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Harmonic Series Waveform Visualizer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background:#030712; color:#f1f5f9; }
+  #wave-canvas { display:block; border:1px solid #1f2937; }
+  input[type=range] { width:100%; accent-color:#a78bfa; }
+</style>
+</head>
+<body class="min-h-screen flex flex-col items-center p-4">
+
+<h1 class="text-2xl font-bold text-purple-400 mt-3 mb-1">Harmonic Series Visualizer</h1>
+<p class="text-gray-400 text-xs mb-3">Add harmonics · adjust amplitude, frequency & phase · hear it</p>
+
+<!-- Controls top -->
+<div class="flex gap-3 mb-3 flex-wrap justify-center">
+  <button onclick="addHarmonic()" id="btn-add" class="px-4 py-1.5 bg-purple-700 hover:bg-purple-600 rounded-lg font-semibold text-sm transition">+ Add Harmonic</button>
+  <button onclick="toggleAnimate()" id="btn-anim" class="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-semibold text-sm transition">⏸ Pause</button>
+  <button onclick="toggleSound()" id="btn-sound" class="px-4 py-1.5 bg-green-800 hover:bg-green-700 rounded-lg font-semibold text-sm transition">🔊 Play Sound</button>
+</div>
+
+<!-- Canvas -->
+<canvas id="wave-canvas" width="700" height="200" aria-label="Waveform display"></canvas>
+
+<!-- Harmonic controls -->
+<div id="harmonics-list" class="mt-4 flex flex-col gap-2 w-full max-w-2xl"></div>
+
+<script>
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+const canvas = document.getElementById('wave-canvas');
+const ctx = canvas.getContext('2d');
+
+const COLORS = ['#a78bfa','#60a5fa','#34d399','#fb923c','#f472b6','#facc15','#38bdf8','#a3e635'];
+
+let harmonics = [];
+let phase = 0;
+let animating = true;
+let rafId = null;
+let audioCtx = null;
+let oscillators = [];
+let gainNodes = [];
+let soundPlaying = false;
+
+function addHarmonic() {
+  if (harmonics.length >= 8) return;
+  const n = harmonics.length + 1;
+  harmonics.push({ freq: n, amp: n === 1 ? 1.0 : Math.round((1/n)*100)/100, phase: 0 });
+  renderControls();
+  if (harmonics.length >= 8) document.getElementById('btn-add').disabled = true;
+}
+
+function removeHarmonic(i) {
+  harmonics.splice(i, 1);
+  document.getElementById('btn-add').disabled = false;
+  renderControls();
+  if (soundPlaying) restartSound();
+}
+
+function renderControls() {
+  const list = document.getElementById('harmonics-list');
+  list.innerHTML = '';
+  harmonics.forEach((h, i) => {
+    const color = COLORS[i % COLORS.length];
+    const div = document.createElement('div');
+    div.className = 'bg-gray-900 rounded-xl p-3 border-l-4';
+    div.style.borderLeftColor = color;
+    const ei = escapeHtml(i), eip1 = escapeHtml(i+1), efreq = escapeHtml(h.freq), eamp = escapeHtml(h.amp.toFixed(2)), ephase = escapeHtml(h.phase), ecolor = escapeHtml(color);
+    div.innerHTML = `
+      <div class="flex items-center justify-between mb-2">
+        <span class="font-semibold text-sm" style="color:${ecolor}">Harmonic ${eip1} · ${efreq}× base freq</span>
+        <button onclick="removeHarmonic(${ei})" class="text-gray-500 hover:text-red-400 text-xs transition" aria-label="Remove harmonic ${eip1}">✕ Remove</button>
+      </div>
+      <div class="grid grid-cols-3 gap-3 text-xs text-gray-400">
+        <div>
+          <label for="freq-${ei}" class="block mb-1">Frequency ×<span id="freq-val-${ei}">${efreq}</span></label>
+          <input id="freq-${ei}" type="range" min="1" max="8" step="1" value="${efreq}" aria-label="Frequency multiplier for harmonic ${eip1}"
+            oninput="updateHarmonic(${ei},'freq',this.value)">
+        </div>
+        <div>
+          <label for="amp-${ei}" class="block mb-1">Amplitude <span id="amp-val-${ei}">${eamp}</span></label>
+          <input id="amp-${ei}" type="range" min="0" max="1" step="0.01" value="${eamp}" aria-label="Amplitude for harmonic ${eip1}"
+            oninput="updateHarmonic(${ei},'amp',this.value)">
+        </div>
+        <div>
+          <label for="phase-${ei}" class="block mb-1">Phase <span id="phase-val-${ei}">${ephase}°</span></label>
+          <input id="phase-${ei}" type="range" min="0" max="360" step="1" value="${ephase}" aria-label="Phase for harmonic ${eip1}"
+            oninput="updateHarmonic(${ei},'phase',this.value)">
+        </div>
+      </div>
+    `;
+    list.appendChild(div);
+  });
+}
+
+function updateHarmonic(i, prop, val) {
+  if (prop === 'freq') {
+    harmonics[i].freq = parseInt(val);
+    document.getElementById(`freq-val-${i}`).textContent = val;
+  } else if (prop === 'amp') {
+    harmonics[i].amp = parseFloat(val);
+    document.getElementById(`amp-val-${i}`).textContent = parseFloat(val).toFixed(2);
+  } else if (prop === 'phase') {
+    harmonics[i].phase = parseInt(val);
+    document.getElementById(`phase-val-${i}`).textContent = val + '°';
+  }
+  if (soundPlaying) updateSoundParams();
+}
+
+// Wave drawing
+function drawWave() {
+  ctx.fillStyle = '#030712';
+  ctx.fillRect(0,0,700,200);
+  const W=700, H=200, cx=100;
+  const steps = W - cx;
+
+  // Axes
+  ctx.strokeStyle = 'rgba(75,85,99,0.5)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cx,H/2); ctx.lineTo(W,H/2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx,10); ctx.lineTo(cx,H-10); ctx.stroke();
+
+  if (harmonics.length === 0) {
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Add harmonics to see waveform', W/2, H/2);
+    return;
+  }
+
+  // Draw individual harmonics
+  harmonics.forEach((h, i) => {
+    const color = COLORS[i % COLORS.length];
+    ctx.strokeStyle = color.replace(')',',0.35)').replace('rgb','rgba').replace('#','rgba(') + '55';
+    // Simple approach: parse hex color and add opacity
+    ctx.globalAlpha = 0.35;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x=0; x<steps; x++) {
+      const t = (x/steps) * Math.PI * 4 + phase * h.freq;
+      const ph = h.phase * Math.PI / 180;
+      const y = H/2 - h.amp * 70 * Math.sin(h.freq * t + ph);
+      x===0 ? ctx.moveTo(cx+x, y) : ctx.lineTo(cx+x, y);
+    }
+    ctx.stroke();
+  });
+
+  // Draw composite
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  for (let x=0; x<steps; x++) {
+    const t = (x/steps) * Math.PI * 4 + phase;
+    let y = 0;
+    harmonics.forEach(h => {
+      const ph = h.phase * Math.PI / 180;
+      y += h.amp * Math.sin(h.freq * t + ph);
+    });
+    const totalAmp = harmonics.reduce((s,h)=>s+h.amp,0) || 1;
+    const ynorm = H/2 - (y/totalAmp) * 80;
+    x===0 ? ctx.moveTo(cx+x, ynorm) : ctx.lineTo(cx+x, ynorm);
+  }
+  ctx.stroke();
+
+  // Labels
+  ctx.globalAlpha = 1;
+  harmonics.forEach((h, i) => {
+    const color = COLORS[i % COLORS.length];
+    ctx.fillStyle = color;
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'left';
+    const y = 20 + i * 16;
+    ctx.fillRect(4, y-9, 12, 10);
+    ctx.fillStyle = '#e5e7eb';
+    ctx.fillText(`H${i+1}: ${h.freq}× amp:${h.amp.toFixed(2)} ph:${h.phase}°`, 20, y);
+  });
+  ctx.fillStyle='#ffffff'; ctx.fillRect(4,20+harmonics.length*16-9,12,10);
+  ctx.fillStyle='#e5e7eb'; ctx.fillText('Composite', 20, 20+harmonics.length*16);
+}
+
+function animate() {
+  if (!animating) return;
+  phase += 0.025;
+  drawWave();
+  rafId = requestAnimationFrame(animate);
+}
+
+function toggleAnimate() {
+  animating = !animating;
+  const btn = document.getElementById('btn-anim');
+  if (animating) {
+    btn.textContent = '⏸ Pause';
+    animate();
+  } else {
+    btn.textContent = '▶ Resume';
+    cancelAnimationFrame(rafId);
+  }
+}
+
+// Web Audio
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function startSound() {
+  if (!audioCtx) initAudio();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  oscillators = [];
+  gainNodes = [];
+  const baseFreq = 110;
+  const masterGain = audioCtx.createGain();
+  masterGain.gain.value = 0.3;
+  masterGain.connect(audioCtx.destination);
+
+  harmonics.forEach(h => {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = baseFreq * h.freq;
+    gain.gain.value = h.amp;
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start();
+    oscillators.push(osc);
+    gainNodes.push(gain);
+  });
+  soundPlaying = true;
+}
+
+function stopSound() {
+  oscillators.forEach(o => { try { o.stop(); } catch(e) {} });
+  oscillators = []; gainNodes = [];
+  soundPlaying = false;
+}
+
+function restartSound() {
+  stopSound(); startSound();
+}
+
+function updateSoundParams() {
+  const baseFreq = 110;
+  oscillators.forEach((osc, i) => {
+    if (harmonics[i]) {
+      osc.frequency.value = baseFreq * harmonics[i].freq;
+      gainNodes[i].gain.value = harmonics[i].amp;
+    }
+  });
+}
+
+function toggleSound() {
+  const btn = document.getElementById('btn-sound');
+  if (soundPlaying) {
+    stopSound();
+    btn.textContent = '🔊 Play Sound';
+    btn.className = 'px-4 py-1.5 bg-green-800 hover:bg-green-700 rounded-lg font-semibold text-sm transition';
+  } else {
+    startSound();
+    btn.textContent = '🔇 Stop Sound';
+    btn.className = 'px-4 py-1.5 bg-red-800 hover:bg-red-700 rounded-lg font-semibold text-sm transition';
+  }
+}
+
+// Init with 3 harmonics
+addHarmonic();
+addHarmonic();
+addHarmonic();
+animate();
+</script>
+</body>
+</html>
